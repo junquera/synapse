@@ -43,7 +43,11 @@ from synapse.api.errors import (
 from synapse.config.key import TrustedKeyServer
 from synapse.events import EventBase
 from synapse.events.utils import prune_event_dict
-from synapse.logging.context import make_deferred_yieldable, run_in_background
+from synapse.logging.context import (
+    PreserveLoggingContext,
+    make_deferred_yieldable,
+    run_in_background,
+)
 from synapse.metrics.background_process_metrics import run_as_background_process
 from synapse.storage.keys import FetchKeyResult
 from synapse.types import JsonDict
@@ -134,17 +138,12 @@ class _Queue:
         d = defer.Deferred()
         self._next_values.append((value, d))
 
-        if self._is_processing:
-            return await d
+        if not self._is_processing:
+            run_as_background_process(self._name, self._unsafe_process)
 
-        run_as_background_process(self._name, self._unsafe_process)
-
-        return await d
+        return await make_deferred_yieldable(d)
 
     async def _unsafe_process(self):
-        # We purposefully defer to the next loop.
-        await self._clock.sleep(0)
-
         try:
             if self._is_processing:
                 return
@@ -152,6 +151,9 @@ class _Queue:
             self._is_processing = True
 
             while self._next_values:
+                # We purposefully defer to the next loop.
+                await self._clock.sleep(0)
+
                 next_values = self._next_values
                 self._next_values = []
 
@@ -160,7 +162,8 @@ class _Queue:
                     results = await self.process_items(values)
 
                     for value, deferred in next_values:
-                        deferred.callback(results.get(value.server_name, {}))
+                        with PreserveLoggingContext():
+                            deferred.callback(results.get(value.server_name, {}))
 
                 except Exception as e:
                     for _, deferred in next_values:
@@ -205,12 +208,13 @@ class Keyring:
     ) -> List[defer.Deferred]:
         return [
             defer.ensureDeferred(
-                self._verify_object(
+                run_in_background(
+                    self._verify_object,
                     VerifyJsonRequest.from_json_object(
                         server_name,
                         validity_time,
                         json_object,
-                    )
+                    ),
                 )
             )
             for server_name, json_object, validity_time, request_name in server_and_json
@@ -220,14 +224,13 @@ class Keyring:
         self, server_and_json: Iterable[Tuple[str, EventBase, int]]
     ) -> List[defer.Deferred]:
         return [
-            defer.ensureDeferred(
-                self._verify_object(
-                    VerifyJsonRequest.from_event(
-                        server_name,
-                        validity_time,
-                        event,
-                    )
-                )
+            run_in_background(
+                self._verify_object,
+                VerifyJsonRequest.from_event(
+                    server_name,
+                    validity_time,
+                    event,
+                ),
             )
             for server_name, event, validity_time in server_and_json
         ]
