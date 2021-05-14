@@ -236,14 +236,24 @@ class Keyring:
         ]
 
     async def _verify_object(self, verify_request: VerifyJsonRequest):
+        if not verify_request.key_ids:
+            raise SynapseError(
+                400,
+                f"Not signed by {verify_request.server_name}",
+                Codes.UNAUTHORIZED,
+            )
+
         # TODO: Use a batching thing.
         with (await self._server_queue.queue(verify_request.server_name)):
+            logger.debug("Starting fetch for %s", verify_request)
+
             found_keys: Dict[str, FetchKeyResult] = {}
             missing_key_ids = set(verify_request.key_ids)
             for fetcher in self._key_fetchers:
                 if not missing_key_ids:
                     break
 
+                logger.debug("Getting keys from %s", fetcher)
                 keys = await fetcher.get_keys(
                     verify_request.server_name,
                     list(missing_key_ids),

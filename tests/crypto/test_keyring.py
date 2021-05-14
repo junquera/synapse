@@ -18,6 +18,7 @@ import attr
 import canonicaljson
 import signedjson.key
 import signedjson.sign
+from typing import List, Dict
 from nacl.signing import SigningKey
 from signedjson.key import encode_verify_key_base64, get_verify_key
 
@@ -70,6 +71,8 @@ class MockPerspectiveServer:
 @attr.s(slots=True)
 class FakeRequest:
     id = attr.ib()
+    ip_address = attr.ib(default="127.0.0.1")
+    site_tag = attr.ib(default="tag")
 
 
 @logcontext_clean
@@ -92,16 +95,16 @@ class KeyringTestCase(unittest.HomeserverTestCase):
         # deferred completes.
         first_lookup_deferred = Deferred()
 
-        async def first_lookup_fetch(keys_to_fetch):
+        async def first_lookup_fetch(
+            server_name: str, key_ids: List[str], minimum_valid_until_ts: int
+        ) -> Dict[str, FetchKeyResult]:
             self.assertEquals(current_context().request.id, "context_11")
-            self.assertEqual(keys_to_fetch, {"server10": {get_key_id(key1): 0}})
+            self.assertEqual(server_name, "server10")
+            self.assertEqual(key_ids, [get_key_id(key1)])
+            self.assertEqual(minimum_valid_until_ts, 0)
 
             await make_deferred_yieldable(first_lookup_deferred)
-            return {
-                "server10": {
-                    get_key_id(key1): FetchKeyResult(get_verify_key(key1), 100)
-                }
-            }
+            return {get_key_id(key1): FetchKeyResult(get_verify_key(key1), 100)}
 
         mock_fetcher.get_keys.side_effect = first_lookup_fetch
 
@@ -131,13 +134,11 @@ class KeyringTestCase(unittest.HomeserverTestCase):
         # a second request for a server with outstanding requests
         # should block rather than start a second call
 
-        async def second_lookup_fetch(keys_to_fetch):
+        async def second_lookup_fetch(
+            server_name: str, key_ids: List[str], minimum_valid_until_ts: int
+        ) -> Dict[str, FetchKeyResult]:
             self.assertEquals(current_context().request.id, "context_12")
-            return {
-                "server10": {
-                    get_key_id(key1): FetchKeyResult(get_verify_key(key1), 100)
-                }
-            }
+            return {get_key_id(key1): FetchKeyResult(get_verify_key(key1), 100)}
 
         mock_fetcher.get_keys.reset_mock()
         mock_fetcher.get_keys.side_effect = second_lookup_fetch
@@ -226,7 +227,7 @@ class KeyringTestCase(unittest.HomeserverTestCase):
 
         # We expect the keyring tried to refetch the key once.
         mock_fetcher.get_keys.assert_called_once_with(
-            {"server9": {get_key_id(key1): 500}}
+            "server9", [get_key_id(key1)], 500
         )
 
         # should succeed on a signed object with a 0 minimum_valid_until_ms
@@ -239,15 +240,15 @@ class KeyringTestCase(unittest.HomeserverTestCase):
         """Two requests for the same key should be deduped."""
         key1 = signedjson.key.generate_signing_key(1)
 
-        async def get_keys(keys_to_fetch):
+        async def get_keys(
+            server_name: str, key_ids: List[str], minimum_valid_until_ts: int
+        ) -> Dict[str, FetchKeyResult]:
             # there should only be one request object (with the max validity)
-            self.assertEqual(keys_to_fetch, {"server1": {get_key_id(key1): 1500}})
+            self.assertEqual(server_name, "server1")
+            self.assertEqual(key_ids, [get_key_id(key1)])
+            self.assertEqual(minimum_valid_until_ts, 1500)
 
-            return {
-                "server1": {
-                    get_key_id(key1): FetchKeyResult(get_verify_key(key1), 1200)
-                }
-            }
+            return {get_key_id(key1): FetchKeyResult(get_verify_key(key1), 1200)}
 
         mock_fetcher = Mock()
         mock_fetcher.get_keys = Mock(side_effect=get_keys)
@@ -274,19 +275,21 @@ class KeyringTestCase(unittest.HomeserverTestCase):
         """If the first fetcher cannot provide a recent enough key, we fall back"""
         key1 = signedjson.key.generate_signing_key(1)
 
-        async def get_keys1(keys_to_fetch):
-            self.assertEqual(keys_to_fetch, {"server1": {get_key_id(key1): 1500}})
-            return {
-                "server1": {get_key_id(key1): FetchKeyResult(get_verify_key(key1), 800)}
-            }
+        async def get_keys1(
+            server_name: str, key_ids: List[str], minimum_valid_until_ts: int
+        ) -> Dict[str, FetchKeyResult]:
+            self.assertEqual(server_name, "server1")
+            self.assertEqual(key_ids, [get_key_id(key1)])
+            self.assertEqual(minimum_valid_until_ts, 1500)
+            return {get_key_id(key1): FetchKeyResult(get_verify_key(key1), 800)}
 
-        async def get_keys2(keys_to_fetch):
-            self.assertEqual(keys_to_fetch, {"server1": {get_key_id(key1): 1500}})
-            return {
-                "server1": {
-                    get_key_id(key1): FetchKeyResult(get_verify_key(key1), 1200)
-                }
-            }
+        async def get_keys2(
+            server_name: str, key_ids: List[str], minimum_valid_until_ts: int
+        ) -> Dict[str, FetchKeyResult]:
+            self.assertEqual(server_name, "server1")
+            self.assertEqual(key_ids, [get_key_id(key1)])
+            self.assertEqual(minimum_valid_until_ts, 1500)
+            return {get_key_id(key1): FetchKeyResult(get_verify_key(key1), 1200)}
 
         mock_fetcher1 = Mock()
         mock_fetcher1.get_keys = Mock(side_effect=get_keys1)
