@@ -130,20 +130,22 @@ class _Queue:
         self._name = name
         self._clock = clock
         self._is_processing = False
-        self._next_values = []
+        self._next_values = {}
 
         self.process_items = process_items
 
-    async def add_to_queue(self, value: _QueueValue) -> Dict[str, FetchKeyResult]:
+    async def add_to_queue(
+        self, value: _QueueValue, key=()
+    ) -> Dict[str, FetchKeyResult]:
         d = defer.Deferred()
-        self._next_values.append((value, d))
+        self._next_values.setdefault(key, []).append((value, d))
 
         if not self._is_processing:
-            run_as_background_process(self._name, self._unsafe_process)
+            run_as_background_process(self._name, self._unsafe_process, key)
 
         return await make_deferred_yieldable(d)
 
-    async def _unsafe_process(self):
+    async def _unsafe_process(self, key):
         try:
             if self._is_processing:
                 return
@@ -154,8 +156,7 @@ class _Queue:
                 # We purposefully defer to the next loop.
                 await self._clock.sleep(0)
 
-                next_values = self._next_values
-                self._next_values = []
+                next_values = self._next_values.pop(key, [])
 
                 try:
                     values = [value for value, _ in next_values]
@@ -643,6 +644,18 @@ class ServerKeyFetcher(BaseV2KeyFetcher):
         super().__init__(hs)
         self.clock = hs.get_clock()
         self.client = hs.get_federation_http_client()
+
+    async def get_keys(
+        self, server_name: str, key_ids: List[str], minimum_valid_until_ts: int
+    ) -> Dict[str, FetchKeyResult]:
+        return await self._queue.add_to_queue(
+            _QueueValue(
+                server_name=server_name,
+                key_ids=key_ids,
+                minimum_valid_until_ts=minimum_valid_until_ts,
+            ),
+            key=server_name,
+        )
 
     async def _fetch_keys(
         self, keys_to_fetch: List[_QueueValue]
