@@ -82,20 +82,16 @@ class VerifyJsonRequest:
     Attributes:
         server_name: The name of the server to verify against.
 
-        json_object: The JSON object to verify.
+        json_object_callback: A callback to fetch the JSON object to verify.
+            A callback is used to allow deferring the creation of the JSON
+            object to verify until needed, e.g. for events we can defer
+            creating the redacted copy. This reduces the memory usage when
+            there are large numbers of in flight requests.
 
         minimum_valid_until_ts: time at which we require the signing key to
             be valid. (0 implies we don't care)
 
         key_ids: The set of key_ids to that could be used to verify the JSON object
-
-        key_ready (Deferred[str, str, nacl.signing.VerifyKey]):
-            A deferred (server_name, key_id, verify_key) tuple that resolves when
-            a verify key has been fetched. The deferreds' callbacks are run with no
-            logcontext.
-
-            If we are unable to find a key which satisfies the request, the deferred
-            errbacks with an M_UNAUTHORIZED SynapseError.
     """
 
     server_name = attr.ib(type=str)
@@ -107,6 +103,9 @@ class VerifyJsonRequest:
     def from_json_object(
         server_name: str, minimum_valid_until_ms: int, json_object: JsonDict
     ):
+        """Generate a request to verify all signatures for the given server in a
+        signed json request."""
+
         key_ids = signature_ids(json_object, server_name)
         return VerifyJsonRequest(
             server_name, lambda: json_object, minimum_valid_until_ms, key_ids
@@ -118,16 +117,23 @@ class VerifyJsonRequest:
         minimum_valid_until_ms: int,
         event: EventBase,
     ):
+        """Generate a request to verify all signatures for the given server on
+        an event."""
         key_ids = list(event.signatures.get(server_name, []))
         return VerifyJsonRequest(
             server_name,
+            # We defer creating the redacted json object, as it uses a lot more
+            # memory than the Event object itself.
             lambda: prune_event_dict(event.room_version, event.get_pdu_json()),
             minimum_valid_until_ms,
             key_ids,
         )
 
-    def to_queue_value(self) -> "_QueueValue":
-        return _QueueValue(
+    def to_fetch_key_request(self) -> "_FetchKeyRequest":
+        """Create a key fetch request for all keys needed to satisfy the
+        verification request.
+        """
+        return _FetchKeyRequest(
             server_name=self.server_name,
             minimum_valid_until_ts=self.minimum_valid_until_ts,
             key_ids=self.key_ids,
@@ -139,7 +145,9 @@ class KeyLookupError(ValueError):
 
 
 @attr.s(slots=True)
-class _QueueValue:
+class _FetchKeyRequest:
+    """A request for keys for a given server."""
+
     server_name = attr.ib(type=str)
     minimum_valid_until_ts = attr.ib(type=int)
     key_ids = attr.ib(type=List[str])
@@ -149,27 +157,57 @@ V = TypeVar("V")
 R = TypeVar("R")
 
 
-class _Queue(Generic[V, R]):
+class _BatchingQueue(Generic[V, R]):
+    """A queue that batches up work, calling the provided processing function
+    with all pending work (for a given key).
+
+    The provided processing function will only be called once at a time for each
+    key.
+
+    Note that the return value of `add_to_queue` will be the return value of the
+    processing function that processed the given item. This means that the
+    returned value will likely include data for other items that were in the
+    batch.
+    """
+
     def __init__(
         self, name: str, clock: Clock, process_items: Callable[[List[V]], Awaitable[R]]
     ):
         self._name = name
         self._clock = clock
+
+        # The set of keys currently being processed.
         self._processing_keys = set()  # type: Set[Hashable]
+
+        # The currently pending batch of values by key, with a Deferred to call
+        # with the result of the corresponding `process_items` call.
         self._next_values = {}  # type: Dict[Hashable, List[Tuple[V, defer.Deferred]]]
 
+        # The function to call with batches of values.
         self.process_items = process_items
 
     async def add_to_queue(self, value: V, key: Hashable = ()) -> R:
+        """Adds the value to the queue with the given key, returning the result
+        of the processing function for the batch that included the given value.
+        """
+
+        # First we create a defer and add it and the value to the list of
+        # pending items.
         d = defer.Deferred()
         self._next_values.setdefault(key, []).append((value, d))
 
+        # If we're not currently processing the key fire off a background
+        # process to start processing.
         if key not in self._processing_keys:
-            run_as_background_process(self._name, self._unsafe_process, key)
+            run_as_background_process(self._name, self._process_queue, key)
 
         return await make_deferred_yieldable(d)
 
-    async def _unsafe_process(self, key: Hashable) -> None:
+    async def _process_queue(self, key: Hashable) -> None:
+        """A background task to repeatedly pull things off the queue for the
+        given key and call the `self.process_items` with the values.
+        """
+
         try:
             if key in self._processing_keys:
                 return
@@ -177,7 +215,11 @@ class _Queue(Generic[V, R]):
             self._processing_keys.add(key)
 
             while self._next_values:
-                # We purposefully defer to the next loop.
+                # We purposefully wait a reactor tick to allow us to batch
+                # together requests that we're about to receive. A common
+                # pattern is to call `add_to_queue` multiple times at once, and
+                # deferring to the next reactor tick allows us to batch all of
+                # those up.
                 await self._clock.sleep(0)
 
                 next_values = self._next_values.pop(key, [])
@@ -200,6 +242,10 @@ class _Queue(Generic[V, R]):
 
 
 class Keyring:
+    """Handles verifying signed JSON objects and fetching the keys needed to do
+    so.
+    """
+
     def __init__(
         self, hs: "HomeServer", key_fetchers: "Optional[Iterable[KeyFetcher]]" = None
     ):
@@ -213,10 +259,10 @@ class Keyring:
             )
         self._key_fetchers = key_fetchers
 
-        self._server_queue = _Queue(
+        self._server_queue = _BatchingQueue(
             "keyring_server",
             clock=hs.get_clock(),
-            process_items=self._inner_verify_requests,
+            process_items=self._inner_fetch_key_requests,
         )
 
     def verify_json_for_server(
@@ -226,12 +272,19 @@ class Keyring:
         validity_time: int,
         request_name: str,
     ) -> defer.Deferred:
+        """Verify all signatures on a single JSON object for the given server
+        name.
+
+        Raises if the object is not signed by the server, the signatures don't
+        match or we failed to fetch the necessary keys.
+        """
+
         request = VerifyJsonRequest.from_json_object(
             server_name,
             validity_time,
             json_object,
         )
-        return defer.ensureDeferred(self._verify_object(request))
+        return defer.ensureDeferred(self.process_request(request))
 
     def verify_json_objects_for_server(
         self, server_and_json: Iterable[Tuple[str, dict, int, str]]
@@ -239,7 +292,7 @@ class Keyring:
         return [
             defer.ensureDeferred(
                 run_in_background(
-                    self._verify_object,
+                    self.process_request,
                     VerifyJsonRequest.from_json_object(
                         server_name,
                         validity_time,
@@ -255,7 +308,7 @@ class Keyring:
     ) -> List[defer.Deferred]:
         return [
             run_in_background(
-                self._verify_object,
+                self.process_request,
                 VerifyJsonRequest.from_event(
                     server_name,
                     validity_time,
@@ -265,7 +318,12 @@ class Keyring:
             for server_name, event, validity_time in server_and_json
         ]
 
-    async def _verify_object(self, verify_request: VerifyJsonRequest) -> None:
+    async def process_request(self, verify_request: VerifyJsonRequest) -> None:
+        """Processes the `VerifyJsonRequest`. Raises if the object is not signed
+        by the server, the signatures don't match or we failed to fetch the
+        necessary keys.
+        """
+
         if not verify_request.key_ids:
             raise SynapseError(
                 400,
@@ -273,11 +331,19 @@ class Keyring:
                 Codes.UNAUTHORIZED,
             )
 
+        # Add they keys we need to verify to the queue for retrieval. We queue
+        # up requests for the same server so we don't end up with many in flight
+        # requests for the same keys.
         found_keys_by_server = await self._server_queue.add_to_queue(
-            verify_request.to_queue_value(), key=verify_request.server_name
+            verify_request.to_fetch_key_request(), key=verify_request.server_name
         )
+
+        # Since we batch up requests the returned set of keys may contain keys
+        # from other servers, so we pull out only the ones we care about.s
         found_keys = found_keys_by_server.get(verify_request.server_name, {})
 
+        # For each signature to check we ensure we have fetched the necessary
+        # keys and the signature matches.
         for key_id in verify_request.key_ids:
             key_result = found_keys.get(key_id)
             if not key_result:
@@ -323,11 +389,16 @@ class Keyring:
                     Codes.UNAUTHORIZED,
                 )
 
-    async def _inner_verify_requests(
-        self, requests: List[_QueueValue]
+    async def _inner_fetch_key_requests(
+        self, requests: List[_FetchKeyRequest]
     ) -> Dict[str, Dict[str, FetchKeyResult]]:
+        """Processing function for the queue of `_FetchKeyRequest`."""
+
         logger.debug("Starting fetch for %s", requests)
 
+        # First we need to deduplicate requests for the same key. We do this by
+        # taking the *maximum* requested `minimum_valid_until_ts` for each pair
+        # of server name/key ID.
         server_to_key_to_ts = {}  # type: Dict[str, Dict[str, int]]
         for request in requests:
             by_server = server_to_key_to_ts.setdefault(request.server_name, {})
@@ -340,18 +411,23 @@ class Keyring:
                     by_server[key_id] = request.minimum_valid_until_ts
 
         deduped_requests = [
-            _QueueValue(server_name, minimum_valid_ts, [key_id])
+            _FetchKeyRequest(server_name, minimum_valid_ts, [key_id])
             for server_name, by_server in server_to_key_to_ts.items()
             for key_id, minimum_valid_ts in by_server.items()
         ]
 
-        logger.debug("deduped to %s", deduped_requests)
+        logger.debug("Deduplicated key requests to %s", deduped_requests)
 
+        # For each key we call `_inner_verify_request` which will handle
+        # fetching each key. Note these shouldn't throw if we fail to contact
+        # other servers etc.
         results_per_request = await yieldable_gather_results(
-            self._inner_verify_request,
+            self._inner_fetch_key_request,
             deduped_requests,
         )
 
+        # We now convert the returned list of results into a map from server
+        # name to key ID to FetchKeyResult, to return.
         to_return = {}  # type: Dict[str, Dict[str, FetchKeyResult]]
         for (request, results) in zip(deduped_requests, results_per_request):
             to_return_by_server = to_return.setdefault(request.server_name, {})
@@ -362,18 +438,22 @@ class Keyring:
 
         return to_return
 
-    async def _inner_verify_request(
-        self, verify_request: _QueueValue
+    async def _inner_fetch_key_request(
+        self, verify_request: _FetchKeyRequest
     ) -> Dict[str, FetchKeyResult]:
+        """Attempt to fetch the given key by calling each key fetcher one by
+        one.
+        """
         logger.debug("Starting fetch for %s", verify_request)
 
         found_keys: Dict[str, FetchKeyResult] = {}
         missing_key_ids = set(verify_request.key_ids)
+
         for fetcher in self._key_fetchers:
             if not missing_key_ids:
                 break
 
-            logger.debug("Getting keys from %s", fetcher)
+            logger.debug("Getting keys from %s for %s", fetcher, verify_request)
             keys = await fetcher.get_keys(
                 verify_request.server_name,
                 list(missing_key_ids),
@@ -384,11 +464,19 @@ class Keyring:
                 if not key:
                     continue
 
+                # If we already have a result for the given key ID we keep the
+                # one with the highest `valid_until_ts`.
                 existing_key = found_keys.get(key_id)
                 if existing_key:
                     if key.valid_until_ts <= existing_key.valid_until_ts:
                         continue
 
+                # We always store the returned key even if it doesn't the
+                # `minimum_valid_until_ts` requirement, as some verification
+                # requests may still be able to be satisfied by it.
+                #
+                # We still keep looking for the key from other fetchers in that
+                # case though.
                 found_keys[key_id] = key
 
                 if key.valid_until_ts < verify_request.minimum_valid_until_ts:
@@ -401,13 +489,15 @@ class Keyring:
 
 class KeyFetcher(metaclass=abc.ABCMeta):
     def __init__(self, hs: "HomeServer"):
-        self._queue = _Queue(self.__class__.__name__, hs.get_clock(), self._fetch_keys)
+        self._queue = _BatchingQueue(
+            self.__class__.__name__, hs.get_clock(), self._fetch_keys
+        )
 
     async def get_keys(
         self, server_name: str, key_ids: List[str], minimum_valid_until_ts: int
     ) -> Dict[str, FetchKeyResult]:
         results = await self._queue.add_to_queue(
-            _QueueValue(
+            _FetchKeyRequest(
                 server_name=server_name,
                 key_ids=key_ids,
                 minimum_valid_until_ts=minimum_valid_until_ts,
@@ -417,7 +507,7 @@ class KeyFetcher(metaclass=abc.ABCMeta):
 
     @abc.abstractmethod
     async def _fetch_keys(
-        self, keys_to_fetch: List[_QueueValue]
+        self, keys_to_fetch: List[_FetchKeyRequest]
     ) -> Dict[str, Dict[str, FetchKeyResult]]:
         pass
 
@@ -430,7 +520,7 @@ class StoreKeyFetcher(KeyFetcher):
 
         self.store = hs.get_datastore()
 
-    async def _fetch_keys(self, keys_to_fetch: List[_QueueValue]):
+    async def _fetch_keys(self, keys_to_fetch: List[_FetchKeyRequest]):
         key_ids_to_fetch = (
             (queue_value.server_name, key_id)
             for queue_value in keys_to_fetch
@@ -556,7 +646,7 @@ class PerspectivesKeyFetcher(BaseV2KeyFetcher):
         self.key_servers = self.config.key_servers
 
     async def _fetch_keys(
-        self, keys_to_fetch: List[_QueueValue]
+        self, keys_to_fetch: List[_FetchKeyRequest]
     ) -> Dict[str, Dict[str, FetchKeyResult]]:
         """see KeyFetcher._fetch_keys"""
 
@@ -594,7 +684,7 @@ class PerspectivesKeyFetcher(BaseV2KeyFetcher):
         return union_of_keys
 
     async def get_server_verify_key_v2_indirect(
-        self, keys_to_fetch: List[_QueueValue], key_server: TrustedKeyServer
+        self, keys_to_fetch: List[_FetchKeyRequest], key_server: TrustedKeyServer
     ) -> Dict[str, Dict[str, FetchKeyResult]]:
         """
         Args:
@@ -733,7 +823,7 @@ class ServerKeyFetcher(BaseV2KeyFetcher):
         self, server_name: str, key_ids: List[str], minimum_valid_until_ts: int
     ) -> Dict[str, FetchKeyResult]:
         results = await self._queue.add_to_queue(
-            _QueueValue(
+            _FetchKeyRequest(
                 server_name=server_name,
                 key_ids=key_ids,
                 minimum_valid_until_ts=minimum_valid_until_ts,
@@ -743,7 +833,7 @@ class ServerKeyFetcher(BaseV2KeyFetcher):
         return results.get(server_name, {})
 
     async def _fetch_keys(
-        self, keys_to_fetch: List[_QueueValue]
+        self, keys_to_fetch: List[_FetchKeyRequest]
     ) -> Dict[str, Dict[str, FetchKeyResult]]:
         """
         Args:
@@ -756,7 +846,7 @@ class ServerKeyFetcher(BaseV2KeyFetcher):
 
         results = {}
 
-        async def get_key(key_to_fetch_item: _QueueValue) -> None:
+        async def get_key(key_to_fetch_item: _FetchKeyRequest) -> None:
             server_name = key_to_fetch_item.server_name
             key_ids = key_to_fetch_item.key_ids
 
