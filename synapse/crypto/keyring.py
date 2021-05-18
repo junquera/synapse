@@ -26,6 +26,7 @@ from typing import (
     Iterable,
     List,
     Optional,
+    Set,
     Tuple,
     TypeVar,
 )
@@ -64,7 +65,7 @@ from synapse.metrics.background_process_metrics import run_as_background_process
 from synapse.storage.keys import FetchKeyResult
 from synapse.types import JsonDict
 from synapse.util import Clock, unwrapFirstError
-from synapse.util.async_helpers import Linearizer, yieldable_gather_results
+from synapse.util.async_helpers import yieldable_gather_results
 from synapse.util.retryutils import NotRetryingDestination
 
 if TYPE_CHECKING:
@@ -125,6 +126,13 @@ class VerifyJsonRequest:
             key_ids,
         )
 
+    def to_queue_value(self) -> "_QueueValue":
+        return _QueueValue(
+            server_name=self.server_name,
+            minimum_valid_until_ts=self.minimum_valid_until_ts,
+            key_ids=self.key_ids,
+        )
+
 
 class KeyLookupError(ValueError):
     pass
@@ -147,7 +155,7 @@ class _Queue(Generic[V, R]):
     ):
         self._name = name
         self._clock = clock
-        self._is_processing = False
+        self._processing_keys = set()  # type: Set[Hashable]
         self._next_values = {}  # type: Dict[Hashable, List[Tuple[V, defer.Deferred]]]
 
         self.process_items = process_items
@@ -156,17 +164,17 @@ class _Queue(Generic[V, R]):
         d = defer.Deferred()
         self._next_values.setdefault(key, []).append((value, d))
 
-        if not self._is_processing:
+        if key not in self._processing_keys:
             run_as_background_process(self._name, self._unsafe_process, key)
 
         return await make_deferred_yieldable(d)
 
     async def _unsafe_process(self, key: Hashable) -> None:
         try:
-            if self._is_processing:
+            if key in self._processing_keys:
                 return
 
-            self._is_processing = True
+            self._processing_keys.add(key)
 
             while self._next_values:
                 # We purposefully defer to the next loop.
@@ -184,10 +192,11 @@ class _Queue(Generic[V, R]):
 
                 except Exception as e:
                     for _, deferred in next_values:
-                        deferred.errback(e)
+                        with PreserveLoggingContext():
+                            deferred.errback(e)
 
         finally:
-            self._is_processing = False
+            self._processing_keys.discard(key)
 
 
 class Keyring:
@@ -204,7 +213,11 @@ class Keyring:
             )
         self._key_fetchers = key_fetchers
 
-        self._server_queue = Linearizer("keyring_server", clock=hs.get_clock())
+        self._server_queue = _Queue(
+            "keyring_server",
+            clock=hs.get_clock(),
+            process_items=self._inner_verify_requests,
+        )
 
     def verify_json_for_server(
         self,
@@ -252,7 +265,7 @@ class Keyring:
             for server_name, event, validity_time in server_and_json
         ]
 
-    async def _verify_object(self, verify_request: VerifyJsonRequest):
+    async def _verify_object(self, verify_request: VerifyJsonRequest) -> None:
         if not verify_request.key_ids:
             raise SynapseError(
                 400,
@@ -260,76 +273,130 @@ class Keyring:
                 Codes.UNAUTHORIZED,
             )
 
-        # TODO: Use a batching thing.
-        with (await self._server_queue.queue(verify_request.server_name)):
-            logger.debug("Starting fetch for %s", verify_request)
+        found_keys_by_server = await self._server_queue.add_to_queue(
+            verify_request.to_queue_value(), key=verify_request.server_name
+        )
+        found_keys = found_keys_by_server.get(verify_request.server_name, {})
 
-            found_keys: Dict[str, FetchKeyResult] = {}
-            missing_key_ids = set(verify_request.key_ids)
-            for fetcher in self._key_fetchers:
-                if not missing_key_ids:
-                    break
-
-                logger.debug("Getting keys from %s", fetcher)
-                keys = await fetcher.get_keys(
-                    verify_request.server_name,
-                    list(missing_key_ids),
-                    verify_request.minimum_valid_until_ts,
-                )
-
-                for key_id, key in keys.items():
-                    if not key:
-                        continue
-
-                    if key.valid_until_ts < verify_request.minimum_valid_until_ts:
-                        continue
-
-                    existing_key = found_keys.get(key_id)
-                    if existing_key:
-                        if key.valid_until_ts <= existing_key.valid_until_ts:
-                            continue
-
-                    found_keys[key_id] = key
-
-                missing_key_ids.difference_update(found_keys)
-
-            if missing_key_ids:
+        for key_id in verify_request.key_ids:
+            key_result = found_keys.get(key_id)
+            if not key_result:
                 raise SynapseError(
-                    400,
-                    "Missing keys for %s: %s"
-                    % (verify_request.server_name, missing_key_ids),
+                    401,
+                    f"Missing keys for {verify_request.server_name}: {key_id}",
                     Codes.UNAUTHORIZED,
                 )
 
-            for key_id in verify_request.key_ids:
-                verify_key = found_keys[key_id].verify_key
-                try:
-                    json_object = verify_request.json_object_callback()
-                    verify_signed_json(
-                        json_object,
-                        verify_request.server_name,
-                        verify_key,
-                    )
-                except SignatureVerifyException as e:
-                    logger.debug(
-                        "Error verifying signature for %s:%s:%s with key %s: %s",
+            if key_result.valid_until_ts < verify_request.minimum_valid_until_ts:
+                raise SynapseError(
+                    401,
+                    f"Failed to find key with recent enough `valid_until_ts` for {verify_request.server_name}: {key_id}",
+                    Codes.UNAUTHORIZED,
+                )
+
+            verify_key = key_result.verify_key
+            try:
+                json_object = verify_request.json_object_callback()
+                verify_signed_json(
+                    json_object,
+                    verify_request.server_name,
+                    verify_key,
+                )
+            except SignatureVerifyException as e:
+                logger.debug(
+                    "Error verifying signature for %s:%s:%s with key %s: %s",
+                    verify_request.server_name,
+                    verify_key.alg,
+                    verify_key.version,
+                    encode_verify_key_base64(verify_key),
+                    str(e),
+                )
+                raise SynapseError(
+                    401,
+                    "Invalid signature for server %s with key %s:%s: %s"
+                    % (
                         verify_request.server_name,
                         verify_key.alg,
                         verify_key.version,
-                        encode_verify_key_base64(verify_key),
                         str(e),
-                    )
-                    raise SynapseError(
-                        401,
-                        "Invalid signature for server %s with key %s:%s: %s"
-                        % (
-                            verify_request.server_name,
-                            verify_key.alg,
-                            verify_key.version,
-                            str(e),
-                        ),
-                        Codes.UNAUTHORIZED,
-                    )
+                    ),
+                    Codes.UNAUTHORIZED,
+                )
+
+    async def _inner_verify_requests(
+        self, requests: List[_QueueValue]
+    ) -> Dict[str, Dict[str, FetchKeyResult]]:
+        logger.debug("Starting fetch for %s", requests)
+
+        server_to_key_to_ts = {}  # type: Dict[str, Dict[str, int]]
+        for request in requests:
+            by_server = server_to_key_to_ts.setdefault(request.server_name, {})
+            for key_id in request.key_ids:
+                existing_ts = by_server.get(key_id)
+
+                if existing_ts:
+                    by_server[key_id] = max(request.minimum_valid_until_ts, existing_ts)
+                else:
+                    by_server[key_id] = request.minimum_valid_until_ts
+
+        deduped_requests = [
+            _QueueValue(server_name, minimum_valid_ts, [key_id])
+            for server_name, by_server in server_to_key_to_ts.items()
+            for key_id, minimum_valid_ts in by_server.items()
+        ]
+
+        logger.debug("deduped to %s", deduped_requests)
+
+        results_per_request = await yieldable_gather_results(
+            self._inner_verify_request,
+            deduped_requests,
+        )
+
+        to_return = {}  # type: Dict[str, Dict[str, FetchKeyResult]]
+        for (request, results) in zip(deduped_requests, results_per_request):
+            to_return_by_server = to_return.setdefault(request.server_name, {})
+            for key_id, key_result in results.items():
+                existing = to_return_by_server.get(key_id)
+                if not existing or existing.valid_until_ts < key_result.valid_until_ts:
+                    to_return_by_server[key_id] = key_result
+
+        return to_return
+
+    async def _inner_verify_request(
+        self, verify_request: _QueueValue
+    ) -> Dict[str, FetchKeyResult]:
+        logger.debug("Starting fetch for %s", verify_request)
+
+        found_keys: Dict[str, FetchKeyResult] = {}
+        missing_key_ids = set(verify_request.key_ids)
+        for fetcher in self._key_fetchers:
+            if not missing_key_ids:
+                break
+
+            logger.debug("Getting keys from %s", fetcher)
+            keys = await fetcher.get_keys(
+                verify_request.server_name,
+                list(missing_key_ids),
+                verify_request.minimum_valid_until_ts,
+            )
+
+            for key_id, key in keys.items():
+                if not key:
+                    continue
+
+                existing_key = found_keys.get(key_id)
+                if existing_key:
+                    if key.valid_until_ts <= existing_key.valid_until_ts:
+                        continue
+
+                found_keys[key_id] = key
+
+                if key.valid_until_ts < verify_request.minimum_valid_until_ts:
+                    continue
+
+                missing_key_ids.discard(key_id)
+
+        return found_keys
 
 
 class KeyFetcher(metaclass=abc.ABCMeta):
