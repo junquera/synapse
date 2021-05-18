@@ -16,7 +16,19 @@
 import abc
 import logging
 import urllib
-from typing import TYPE_CHECKING, Callable, Dict, Iterable, List, Optional, Tuple
+from typing import (
+    TYPE_CHECKING,
+    Awaitable,
+    Callable,
+    Dict,
+    Generic,
+    Hashable,
+    Iterable,
+    List,
+    Optional,
+    Tuple,
+    TypeVar,
+)
 
 import attr
 from signedjson.key import (
@@ -51,7 +63,7 @@ from synapse.logging.context import (
 from synapse.metrics.background_process_metrics import run_as_background_process
 from synapse.storage.keys import FetchKeyResult
 from synapse.types import JsonDict
-from synapse.util import unwrapFirstError
+from synapse.util import Clock, unwrapFirstError
 from synapse.util.async_helpers import Linearizer, yieldable_gather_results
 from synapse.util.retryutils import NotRetryingDestination
 
@@ -125,18 +137,22 @@ class _QueueValue:
     key_ids = attr.ib(type=List[str])
 
 
-class _Queue:
-    def __init__(self, name, clock, process_items):
+V = TypeVar("V")
+R = TypeVar("R")
+
+
+class _Queue(Generic[V, R]):
+    def __init__(
+        self, name: str, clock: Clock, process_items: Callable[[List[V]], Awaitable[R]]
+    ):
         self._name = name
         self._clock = clock
         self._is_processing = False
-        self._next_values = {}
+        self._next_values = {}  # type: Dict[Hashable, List[Tuple[V, defer.Deferred]]]
 
         self.process_items = process_items
 
-    async def add_to_queue(
-        self, value: _QueueValue, key=()
-    ) -> Dict[str, FetchKeyResult]:
+    async def add_to_queue(self, value: V, key: Hashable = ()) -> R:
         d = defer.Deferred()
         self._next_values.setdefault(key, []).append((value, d))
 
@@ -145,7 +161,7 @@ class _Queue:
 
         return await make_deferred_yieldable(d)
 
-    async def _unsafe_process(self, key):
+    async def _unsafe_process(self, key: Hashable) -> None:
         try:
             if self._is_processing:
                 return
@@ -162,9 +178,9 @@ class _Queue:
                     values = [value for value, _ in next_values]
                     results = await self.process_items(values)
 
-                    for value, deferred in next_values:
+                    for _, deferred in next_values:
                         with PreserveLoggingContext():
-                            deferred.callback(results.get(value.server_name, {}))
+                            deferred.callback(results)
 
                 except Exception as e:
                     for _, deferred in next_values:
@@ -188,7 +204,7 @@ class Keyring:
             )
         self._key_fetchers = key_fetchers
 
-        self._server_queue = Linearizer("keyring_server")
+        self._server_queue = Linearizer("keyring_server", clock=hs.get_clock())
 
     def verify_json_for_server(
         self,
@@ -323,13 +339,14 @@ class KeyFetcher(metaclass=abc.ABCMeta):
     async def get_keys(
         self, server_name: str, key_ids: List[str], minimum_valid_until_ts: int
     ) -> Dict[str, FetchKeyResult]:
-        return await self._queue.add_to_queue(
+        results = await self._queue.add_to_queue(
             _QueueValue(
                 server_name=server_name,
                 key_ids=key_ids,
                 minimum_valid_until_ts=minimum_valid_until_ts,
             )
         )
+        return results.get(server_name, {})
 
     @abc.abstractmethod
     async def _fetch_keys(
@@ -648,7 +665,7 @@ class ServerKeyFetcher(BaseV2KeyFetcher):
     async def get_keys(
         self, server_name: str, key_ids: List[str], minimum_valid_until_ts: int
     ) -> Dict[str, FetchKeyResult]:
-        return await self._queue.add_to_queue(
+        results = await self._queue.add_to_queue(
             _QueueValue(
                 server_name=server_name,
                 key_ids=key_ids,
@@ -656,6 +673,7 @@ class ServerKeyFetcher(BaseV2KeyFetcher):
             ),
             key=server_name,
         )
+        return results.get(server_name, {})
 
     async def _fetch_keys(
         self, keys_to_fetch: List[_QueueValue]
