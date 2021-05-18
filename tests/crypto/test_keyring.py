@@ -71,14 +71,6 @@ class MockPerspectiveServer:
 @attr.s(slots=True)
 class FakeRequest:
     id = attr.ib()
-    ip_address = attr.ib(default="127.0.0.1")
-    site_tag = attr.ib(default="tag")
-    requester = attr.ib(default=None)
-    authenticated_entity = attr.ib(default=None)
-    method = attr.ib(default=None)
-    url = attr.ib(default=None)
-    protocol = attr.ib(default=None)
-    user_agent = attr.ib(default=None)
 
 
 @logcontext_clean
